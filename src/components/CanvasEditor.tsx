@@ -4,7 +4,7 @@ import { Copy, Download, Undo2, ImagePlus, Sparkles, Grid2x2, Square, Wand2, Fil
 import { useLanguage } from "@/context/LanguageContext";
 import { translations } from "@/lib/translations";
 import { jsPDF } from "jspdf";
-import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import { GlobalWorkerOptions, getDocument, version } from "pdfjs-dist";
 import Tesseract from "tesseract.js";
 
 type ToolType = "blur" | "pixelate" | "block" | "text";
@@ -300,7 +300,7 @@ export default function CanvasEditor() {
 
   async function loadFile(file: File) {
     if (file.type === "application/pdf") {
-      GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+      GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${version}/build/pdf.worker.min.js`;
       const data = await file.arrayBuffer();
       const pdf = await getDocument({ data }).promise;
       const newPages: { id: string; image: HTMLImageElement; actions: Action[] }[] = [];
