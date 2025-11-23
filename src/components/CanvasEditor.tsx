@@ -484,7 +484,7 @@ export default function CanvasEditor() {
                   const canvas = canvasRef.current;
                   if (!canvas) { setScanning(false); return; }
                   const result = await Tesseract.recognize(canvas, "eng");
-                  const words = (result.data.words ?? []) as { text?: string; bbox?: { x0: number; y0: number; x1: number; y1: number } }[];
+                  const words = ((result.data as any).words ?? []) as { text?: string; bbox?: { x0: number; y0: number; x1: number; y1: number } }[];
                   const email = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
                   const phone = /(\+?\d[\d\s-]{7,}\d)/;
                   const toAdd: Action[] = [];
