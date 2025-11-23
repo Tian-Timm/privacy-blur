@@ -310,7 +310,7 @@ export default function CanvasEditor() {
         const c = document.createElement("canvas");
         c.width = viewport.width;
         c.height = viewport.height;
-        await page.render({ canvasContext: c.getContext("2d") as CanvasRenderingContext2D, viewport }).promise;
+        await page.render({ canvasContext: c.getContext("2d") as CanvasRenderingContext2D, viewport } as any).promise;
         const img = new Image();
         img.src = c.toDataURL("image/png");
         await new Promise<void>((res) => { img.onload = () => res(); });
