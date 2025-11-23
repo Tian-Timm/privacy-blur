@@ -300,7 +300,7 @@ export default function CanvasEditor() {
 
   async function loadFile(file: File) {
     if (file.type === "application/pdf") {
-      GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${version}/build/pdf.worker.min.js`;
+      GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@5.4.394/build/pdf.worker.min.js`;
       const data = await file.arrayBuffer();
       const pdf = await getDocument({ data }).promise;
       const newPages: { id: string; image: HTMLImageElement; actions: Action[] }[] = [];
