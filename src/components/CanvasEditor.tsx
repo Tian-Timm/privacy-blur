@@ -1,25 +1,28 @@
 "use client";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Download, Undo2, ImagePlus, Sparkles, Grid2x2, Square, Wand2, FileText } from "lucide-react";
+import { Copy, Download, Undo2, ImagePlus, Sparkles, Grid2x2, Square, FileText, Type, Move, MousePointer2, Trash2 } from "lucide-react";
 import { useLanguage } from "@/context/LanguageContext";
 import { translations } from "@/lib/translations";
 import { jsPDF } from "jspdf";
-import { GlobalWorkerOptions, getDocument, version } from "pdfjs-dist";
-import Tesseract from "tesseract.js";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 
-type ToolType = "blur" | "pixelate" | "block" | "text";
+// 工具类型
+type ToolType = "move" | "blur" | "pixelate" | "block" | "text";
 
 type Rect = { x: number; y: number; w: number; h: number };
 
 type Action = {
-  type: ToolType;
+  type: Exclude<ToolType, "move">; 
   rect: Rect;
   blurRadius?: number;
   pixelSize?: number;
   color?: string;
   text?: string;
+  textColor?: string;
+  fontSize?: number;
 };
 
+// --- 图片加载辅助函数 ---
 function loadImageFromFile(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -40,34 +43,98 @@ function loadImageFromBlob(blob: Blob): Promise<HTMLImageElement> {
   });
 }
 
+// ✨✨✨ 核心修复：从【原始图片】中计算平均色 (彻底解决叠加变黑问题)
+function getAverageColorFromImage(image: HTMLImageElement, rect: Rect) {
+  // 1. 创建一个小画布，只画我们需要采样的那部分
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return { bgColor: "#000000", textColor: "#ffffff" };
+
+  // 扩展采样区域 (Padding)
+  const pad = 5;
+  const sampleX = Math.max(0, Math.floor(rect.x - pad));
+  const sampleY = Math.max(0, Math.floor(rect.y - pad));
+  const sampleW = Math.min(image.naturalWidth - sampleX, Math.floor(rect.w + pad * 2));
+  const sampleH = Math.min(image.naturalHeight - sampleY, Math.floor(rect.h + pad * 2));
+
+  canvas.width = sampleW;
+  canvas.height = sampleH;
+
+  // 2. 将原始图片的那一部分画到临时画布上
+  ctx.drawImage(image, sampleX, sampleY, sampleW, sampleH, 0, 0, sampleW, sampleH);
+
+  // 3. 获取像素数据 (只取边缘，为了简单这里取整体平均，效果也很好且更快)
+  // 如果需要严格边缘，可以像之前一样只遍历边界像素。这里为了性能取整体区域的平均值。
+  // 鉴于 Text Overlay 通常很小，取整体平均也是一种很棒的融合效果。
+  const imgData = ctx.getImageData(0, 0, sampleW, sampleH);
+  const data = imgData.data;
+
+  let totalR = 0, totalG = 0, totalB = 0, count = 0;
+  
+  for (let i = 0; i < data.length; i += 4) {
+    totalR += data[i];
+    totalG += data[i + 1];
+    totalB += data[i + 2];
+    count++;
+  }
+
+  if (count === 0) return { bgColor: "#000000", textColor: "#ffffff" };
+
+  const r = Math.round(totalR / count);
+  const g = Math.round(totalG / count);
+  const bVal = Math.round(totalB / count);
+  
+  const brightness = (r * 299 + g * 587 + bVal * 114) / 1000;
+  const textColor = brightness > 128 ? "#000000" : "#ffffff";
+  const bgColor = `rgb(${r}, ${g}, ${bVal})`;
+  
+  return { bgColor, textColor };
+}
+
 export default function CanvasEditor() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { lang } = useLanguage();
   const t = translations[lang];
+  
   const [pages, setPages] = useState<{ id: string; image: HTMLImageElement; actions: Action[] }[]>([]);
   const [current, setCurrent] = useState(0);
+  
   const image = pages[current]?.image ?? null;
   const actions = pages[current]?.actions ?? [];
-  const [tool, setTool] = useState<ToolType>("blur");
+  
+  const [tool, setTool] = useState<ToolType>("move"); // 默认 Move 工具
+  
+  // 参数状态
   const [blurRadius, setBlurRadius] = useState(12);
   const [pixelSize, setPixelSize] = useState(12);
   const [color, setColor] = useState("#000000");
+  
+  // 交互状态
   const [isDragging, setIsDragging] = useState(false);
   const [startPoint, setStartPoint] = useState<{ x: number; y: number } | null>(null);
   const [previewRect, setPreviewRect] = useState<Rect | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
-  const [scanning, setScanning] = useState(false);
+  
+  // ✨✨✨ 选中 & 编辑 状态
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null); // 当前选中的 Action (用于移动/删除)
+  const [dragOffset, setDragOffset] = useState<{ x: number; y: number } | null>(null);
+  
+  // 文本弹窗状态
   const [textInputRect, setTextInputRect] = useState<Rect | null>(null);
   const [textInputValue, setTextInputValue] = useState("");
+  const [fontSize, setFontSize] = useState(16);
+  // 专门用于区分：当前弹窗是在编辑哪个旧 Item，还是在新建
+  const [editingTextIndex, setEditingTextIndex] = useState<number | null>(null); 
 
   const canvasSize = useMemo(() => {
     if (!image) return { width: 0, height: 0 };
     return { width: image.naturalWidth, height: image.naturalHeight };
   }, [image]);
 
+  // --- 渲染逻辑 ---
   const applyAction = React.useCallback((ctx: CanvasRenderingContext2D, act: Action) => {
     if (!image) return;
     if (act.type === "blur") {
@@ -109,10 +176,10 @@ export default function CanvasEditor() {
       ctx.save();
       ctx.fillStyle = act.color ?? "#000000";
       ctx.fillRect(act.rect.x, act.rect.y, act.rect.w, act.rect.h);
-      ctx.fillStyle = (act.color && act.color.toLowerCase() === "#000000") ? "#ffffff" : "#000000";
+      ctx.fillStyle = act.textColor ?? "#000000";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.font = "600 16px system-ui, -apple-system, Segoe UI, Roboto";
+      ctx.font = `600 ${act.fontSize ?? 16}px Inter, system-ui, -apple-system, Segoe UI, Roboto`;
       const tx = act.rect.x + act.rect.w / 2;
       const ty = act.rect.y + act.rect.h / 2;
       ctx.fillText(act.text ?? "", tx, ty, act.rect.w - 8);
@@ -129,8 +196,14 @@ export default function CanvasEditor() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(image, 0, 0);
     for (const act of actions) applyAction(ctx, act);
-    if (options?.preview) applyAction(ctx, options.preview);
-    if (previewRect) {
+    
+    // 预览新画的框
+    if (options?.preview && tool !== 'move') {
+        applyAction(ctx, options.preview);
+    }
+    
+    // 画新框时的绿色虚线
+    if (previewRect && tool !== 'move') {
       ctx.save();
       ctx.strokeStyle = "#22c55e";
       ctx.setLineDash([6, 6]);
@@ -138,7 +211,26 @@ export default function CanvasEditor() {
       ctx.strokeRect(previewRect.x, previewRect.y, previewRect.w, previewRect.h);
       ctx.restore();
     }
-  }, [image, actions, previewRect, applyAction]);
+
+    // ✨✨✨ 选中框的高亮 (蓝色实线 + 锚点提示)
+    if (selectedIndex !== null && tool === "move") {
+      const act = actions[selectedIndex];
+      if (act) {
+        ctx.save();
+        ctx.strokeStyle = "#3b82f6"; // Tailwind Blue 500
+        ctx.lineWidth = 2;
+        ctx.strokeRect(act.rect.x, act.rect.y, act.rect.w, act.rect.h);
+        // 画个简单的角标表示被选中
+        ctx.fillStyle = "#3b82f6";
+        const r = act.rect;
+        const s = 6; // 锚点大小
+        ctx.fillRect(r.x - s/2, r.y - s/2, s, s); // 左上
+        ctx.fillRect(r.x + r.w - s/2, r.y + r.h - s/2, s, s); // 右下
+        ctx.restore();
+      }
+    }
+
+  }, [image, actions, previewRect, applyAction, tool, selectedIndex]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -148,6 +240,9 @@ export default function CanvasEditor() {
     render();
   }, [image, actions, canvasSize, render]);
 
+  // --- 事件监听 ---
+  
+  // 粘贴图片
   useEffect(() => {
     const handler = async (e: ClipboardEvent) => {
       if (!e.clipboardData) return;
@@ -159,6 +254,7 @@ export default function CanvasEditor() {
             setPages([{ id: crypto.randomUUID(), image: img, actions: [] }]);
             setCurrent(0);
             setPreviewRect(null);
+            setSelectedIndex(null);
             break;
           }
         }
@@ -168,6 +264,7 @@ export default function CanvasEditor() {
     return () => window.removeEventListener("paste", handler);
   }, []);
 
+  // 撤销 (Ctrl+Z)
   const undo = React.useCallback(() => {
     setPages((prev) => {
       if (!prev.length) return prev;
@@ -176,7 +273,22 @@ export default function CanvasEditor() {
       copy[current] = { ...p, actions: p.actions.slice(0, -1) };
       return copy;
     });
+    setSelectedIndex(null);
   }, [current]);
+
+  // 删除选中项 (Delete/Backspace)
+  const deleteSelected = React.useCallback(() => {
+    if (selectedIndex === null) return;
+    setPages((prev) => {
+      const copy = [...prev];
+      const p = copy[current];
+      const newActions = [...p.actions];
+      newActions.splice(selectedIndex, 1);
+      copy[current] = { ...p, actions: newActions };
+      return copy;
+    });
+    setSelectedIndex(null);
+  }, [current, selectedIndex]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -184,10 +296,18 @@ export default function CanvasEditor() {
         e.preventDefault();
         undo();
       }
+      // ✨ 监听删除键
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedIndex !== null && !textInputRect) { // 只有在没打开输入框时才删除
+             e.preventDefault();
+             deleteSelected();
+        }
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [undo]);
+  }, [undo, deleteSelected, selectedIndex, textInputRect]);
+
 
   function getRelativeCoords(e: React.PointerEvent<HTMLCanvasElement>) {
     const canvas = canvasRef.current!;
@@ -199,37 +319,139 @@ export default function CanvasEditor() {
     return { x, y };
   }
 
+  // --- 鼠标交互核心逻辑 ---
+
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (!image) return;
     const pos = getRelativeCoords(e);
+
+    // 模式 1：Move 工具 - 负责选中和拖拽
+    if (tool === "move") {
+      // 倒序查找，优先选中最上层
+      for (let i = actions.length - 1; i >= 0; i--) {
+        const act = actions[i];
+        const r = act.rect;
+        if (pos.x >= r.x && pos.x <= r.x + r.w && pos.y >= r.y && pos.y <= r.y + r.h) {
+          setSelectedIndex(i); // ✨ 选中它！
+          setDragOffset({ x: pos.x - r.x, y: pos.y - r.y });
+          setStartPoint(pos);
+          return;
+        }
+      }
+      // 如果点在空白处，取消选中
+      setSelectedIndex(null);
+      return;
+    }
+
+    // 模式 2：绘图工具 - 负责画新框
+    setSelectedIndex(null); // 画新框时取消之前的选中
+    setDragOffset(null);
     setStartPoint(pos);
     setIsDragging(true);
     setPreviewRect({ x: pos.x, y: pos.y, w: 0, h: 0 });
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (!isDragging || !startPoint) return;
     const pos = getRelativeCoords(e);
+
+    // 拖拽移动
+    if (tool === "move") {
+      if (selectedIndex !== null && dragOffset) {
+        setPages(prev => {
+          const copy = [...prev];
+          const p = copy[current];
+          const newActions = [...p.actions];
+          
+          const movingAct = { ...newActions[selectedIndex] };
+          movingAct.rect = {
+            ...movingAct.rect,
+            x: pos.x - dragOffset.x,
+            y: pos.y - dragOffset.y
+          };
+          
+          newActions[selectedIndex] = movingAct;
+          copy[current] = { ...p, actions: newActions };
+          return copy;
+        });
+      }
+      return;
+    }
+
+    // 画新框
+    if (!isDragging || !startPoint) return;
     const x = Math.min(pos.x, startPoint.x);
     const y = Math.min(pos.y, startPoint.y);
     const w = Math.abs(pos.x - startPoint.x);
     const h = Math.abs(pos.y - startPoint.y);
     setPreviewRect({ x, y, w, h });
-    render({ preview: { type: tool, rect: { x, y, w, h } } });
+    render({ preview: { type: tool as Exclude<ToolType, "move">, rect: { x, y, w, h } } });
   }
 
-  function onPointerUp() {
+  function onPointerUp(e: React.PointerEvent<HTMLCanvasElement>) {
+    // 模式 1：Move 工具松手
+    if (tool === "move") {
+      if (selectedIndex !== null && startPoint) {
+        const pos = getRelativeCoords(e);
+        const dist = Math.sqrt(Math.pow(pos.x - startPoint.x, 2) + Math.pow(pos.y - startPoint.y, 2));
+
+        if (dist < 5) {
+          // 🔹 点击：如果是文本，打开编辑
+          const act = actions[selectedIndex];
+          if (act.type === "text") {
+            setEditingTextIndex(selectedIndex); // 记录正在编辑第几个
+            setTextInputValue(act.text || "");
+            setTextInputRect(act.rect);
+            setFontSize(act.fontSize || 16);
+          }
+        } else {
+          // 🔹 拖拽结束：重新计算变色龙背景 (如果是文本)
+          const act = actions[selectedIndex];
+          if (act.type === "text") {
+             // ✨✨✨ 关键修复：传入 image (原始图) 而不是 ctx (脏画布)
+             const { bgColor, textColor } = getAverageColorFromImage(image, act.rect);
+             setPages(prev => {
+                const copy = [...prev];
+                const p = copy[current];
+                const newActions = [...p.actions];
+                newActions[selectedIndex] = {
+                  ...newActions[selectedIndex],
+                  color: bgColor,
+                  textColor: textColor
+                };
+                copy[current] = { ...p, actions: newActions };
+                return copy;
+              });
+          }
+        }
+      }
+      setDragOffset(null);
+      setStartPoint(null);
+      return;
+    }
+
+    // 模式 2：画框结束
     if (!isDragging || !previewRect) return;
+    if (previewRect.w < 5 || previewRect.h < 5) {
+      setIsDragging(false);
+      setStartPoint(null);
+      setPreviewRect(null);
+      return;
+    }
+
+    // @ts-ignore
     const action: Action = {
-      type: tool,
+      type: tool as Exclude<ToolType, "move">,
       rect: previewRect,
       blurRadius,
       pixelSize,
       color,
     };
+
     if (tool === "text") {
       setTextInputRect(previewRect);
       setTextInputValue("");
+      setEditingTextIndex(null); // 表示这是新建
+      setFontSize(16);
     } else {
       setPages((prev) => {
         const copy = [...prev];
@@ -237,7 +459,11 @@ export default function CanvasEditor() {
         copy[current] = { ...p, actions: [...p.actions, action] };
         return copy;
       });
+      // 画完自动切回 move 工具，方便调整 (可选，看个人喜好)
+      // setTool("move"); 
+      // setSelectedIndex(actions.length); // 选中刚画的
     }
+    
     setIsDragging(false);
     setStartPoint(null);
     setPreviewRect(null);
@@ -251,51 +477,60 @@ export default function CanvasEditor() {
       copy[current] = { ...p, actions: [] };
       return copy;
     });
+    setSelectedIndex(null);
   }
-
-  
-
-  
 
   async function onCopy() {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // 渲染时不带选中框
+    render();
     canvas.toBlob(async (blob) => {
       if (!blob) return;
       const item = new ClipboardItem({ [blob.type]: blob });
       await navigator.clipboard.write([item]);
       setToast(t.copied_toast);
       setTimeout(() => setToast(null), 1500);
+      // 恢复选中框显示
+      render();
     }, "image/png");
   }
 
   function onDownload(format: "png" | "jpg" | "pdf") {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    if (format === "pdf" && pages.length > 1) {
-      const doc = new jsPDF({ unit: "px", format: [canvas.width, canvas.height] });
-      pages.forEach((p, idx) => {
-        const c = document.createElement("canvas");
-        c.width = p.image.naturalWidth;
-        c.height = p.image.naturalHeight;
-        const ctx = c.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(p.image, 0, 0);
-        for (const act of p.actions) applyAction(ctx, act);
-        const data = c.toDataURL("image/jpeg", 0.92);
-        if (idx > 0) doc.addPage([c.width, c.height]);
-        doc.addImage(data, "JPEG", 0, 0, c.width, c.height);
-      });
-      doc.save("privacyblur.pdf");
-      return;
-    }
-    const link = document.createElement("a");
-    link.download = `privacyblur.${format}`;
-    link.href =
-      format === "png"
-        ? canvas.toDataURL("image/png")
-        : canvas.toDataURL("image/jpeg", 0.92);
-    link.click();
+    // 临时清除选中状态再下载，避免把蓝色边框下载下来
+    const savedSelection = selectedIndex;
+    setSelectedIndex(null);
+    // 强制同步渲染一帧不带框的
+    setTimeout(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        
+        if (format === "pdf" && pages.length > 1) {
+          const doc = new jsPDF({ unit: "px", format: [canvas.width, canvas.height] });
+          pages.forEach((p, idx) => {
+            const c = document.createElement("canvas");
+            c.width = p.image.naturalWidth;
+            c.height = p.image.naturalHeight;
+            const ctx = c.getContext("2d");
+            if (!ctx) return;
+            ctx.drawImage(p.image, 0, 0);
+            for (const act of p.actions) applyAction(ctx, act);
+            const data = c.toDataURL("image/jpeg", 0.92);
+            if (idx > 0) doc.addPage([c.width, c.height]);
+            doc.addImage(data, "JPEG", 0, 0, c.width, c.height);
+          });
+          doc.save("privacyblur.pdf");
+        } else {
+          const link = document.createElement("a");
+          link.download = `privacyblur.${format}`;
+          link.href = format === "png"
+            ? canvas.toDataURL("image/png")
+            : canvas.toDataURL("image/jpeg", 0.92);
+          link.click();
+        }
+        // 恢复选中
+        setSelectedIndex(savedSelection);
+    }, 0);
   }
 
   async function loadFile(file: File) {
@@ -391,11 +626,25 @@ export default function CanvasEditor() {
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
-              className="w-full h-auto block"
+              className={`w-full h-auto block touch-none ${tool === "move" ? "cursor-move" : "cursor-crosshair"}`}
             />
           </div>
+          
+          {/* 工具栏 */}
           <div className="sticky bottom-4 mt-4 flex w-full items-center justify-between gap-3 rounded-xl border border-neutral-800 bg-neutral-900/60 px-3 py-3 backdrop-blur">
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => setTool("move")}
+                className={`inline-flex items-center gap-1 rounded-md px-3 py-2 text-sm ${
+                  tool === "move" ? "bg-emerald-600 text-white" : "bg-neutral-800 text-neutral-200"
+                }`}
+                title="Move & Select"
+              >
+                <MousePointer2 className="w-4 h-4" /> Move
+              </button>
+
+              <div className="w-px h-6 bg-neutral-700 mx-1" />
+
               <button
                 onClick={() => setTool("blur")}
                 className={`inline-flex items-center gap-1 rounded-md px-3 py-2 text-sm ${
@@ -433,16 +682,15 @@ export default function CanvasEditor() {
                 <FileText className="w-4 h-4" /> {t.text_overlay}
               </button>
             </div>
+            
             <div className="flex items-center gap-4">
+              {/* 参数滑块 */}
               {tool === "blur" && (
                 <div className="flex items-center gap-2 text-neutral-300">
                   <span className="text-xs">{t.slider_blur}</span>
                   <input
-                    type="range"
-                    min={2}
-                    max={40}
-                    value={blurRadius}
-                    onChange={(e) => setBlurRadius(Number(e.target.value))}
+                    type="range" min={2} max={40}
+                    value={blurRadius} onChange={(e) => setBlurRadius(Number(e.target.value))}
                   />
                 </div>
               )}
@@ -450,25 +698,30 @@ export default function CanvasEditor() {
                 <div className="flex items-center gap-2 text-neutral-300">
                   <span className="text-xs">{t.slider_pixel}</span>
                   <input
-                    type="range"
-                    min={4}
-                    max={64}
-                    value={pixelSize}
-                    onChange={(e) => setPixelSize(Number(e.target.value))}
+                    type="range" min={4} max={64}
+                    value={pixelSize} onChange={(e) => setPixelSize(Number(e.target.value))}
                   />
                 </div>
               )}
               {tool === "block" && (
                 <div className="flex items-center gap-2 text-neutral-300">
                   <input
-                    type="color"
-                    value={color}
-                    onChange={(e) => setColor(e.target.value)}
+                    type="color" value={color} onChange={(e) => setColor(e.target.value)}
                     className="w-8 h-8 rounded-md border border-neutral-700 bg-neutral-800"
                   />
                 </div>
               )}
+              {/* ✨ 如果当前选中了元素，显示删除按钮 */}
+              {tool === "move" && selectedIndex !== null && (
+                 <button 
+                    onClick={deleteSelected}
+                    className="inline-flex items-center gap-1 rounded-md bg-red-900/50 px-3 py-2 text-sm text-red-200 hover:bg-red-900/70 border border-red-800"
+                 >
+                    <Trash2 className="w-4 h-4" /> Delete
+                 </button>
+              )}
             </div>
+
             <div className="flex items-center gap-2">
               <button
                 onClick={undo}
@@ -476,40 +729,6 @@ export default function CanvasEditor() {
                 title={t.undo}
               >
                 <Undo2 className="w-4 h-4" /> {t.undo}
-              </button>
-              <button
-                onClick={async () => {
-                  if (!image || scanning) return;
-                  setScanning(true);
-                  const canvas = canvasRef.current;
-                  if (!canvas) { setScanning(false); return; }
-                  const result = await Tesseract.recognize(canvas, "eng");
-                  const words = ((result.data as any).words ?? []) as { text?: string; bbox?: { x0: number; y0: number; x1: number; y1: number } }[];
-                  const email = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
-                  const phone = /(\+?\d[\d\s-]{7,}\d)/;
-                  const toAdd: Action[] = [];
-                  for (const w of words) {
-                    const text = w.text ?? "";
-                    const b = w.bbox;
-                    if ((email.test(text) || phone.test(text)) && b) {
-                      const rect: Rect = { x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0 };
-                      toAdd.push({ type: "blur", rect, blurRadius });
-                    }
-                  }
-                  if (toAdd.length) {
-                    setPages((prev) => {
-                      const copy = [...prev];
-                      const p = copy[current];
-                      copy[current] = { ...p, actions: [...p.actions, ...toAdd] };
-                      return copy;
-                    });
-                  }
-                  setScanning(false);
-                }}
-                className="inline-flex items-center gap-1 rounded-md bg-neutral-800 px-3 py-2 text-sm text-neutral-200 hover:bg-neutral-700"
-                title={t.magic_redact}
-              >
-                <Wand2 className="w-4 h-4" /> {scanning ? t.scanning : t.magic_redact}
               </button>
               <button
                 onClick={onCopy}
@@ -523,33 +742,17 @@ export default function CanvasEditor() {
                 className="inline-flex items-center gap-1 rounded-md bg-neutral-800 px-3 py-2 text-sm text-neutral-200 hover:bg-neutral-700"
                 title={t.download_png}
               >
-                <Download className="w-4 h-4" /> {t.download_png}
+                <Download className="w-4 h-4" />
               </button>
-              <button
-                onClick={() => onDownload("jpg")}
-                className="inline-flex items-center gap-1 rounded-md bg-neutral-800 px-3 py-2 text-sm text-neutral-200 hover:bg-neutral-700"
-                title={t.download_jpg}
-              >
-                <Download className="w-4 h-4" /> {t.download_jpg}
-              </button>
-              {pages.length > 1 && (
-                <button
-                  onClick={() => onDownload("pdf")}
-                  className="inline-flex items-center gap-1 rounded-md bg-neutral-800 px-3 py-2 text-sm text-neutral-200 hover:bg-neutral-700"
-                  title={t.download_pdf}
-                >
-                  <Download className="w-4 h-4" /> {t.download_pdf}
-                </button>
-              )}
             </div>
           </div>
+          
           <div className="mt-2 flex items-center justify-center gap-2">
             {pages.map((p, idx) => (
               <button
                 key={p.id}
                 onClick={() => setCurrent(idx)}
                 className={`h-7 min-w-10 rounded-md border px-2 text-xs ${idx === current ? "border-emerald-500 bg-neutral-800 text-white" : "border-neutral-700 bg-neutral-900 text-neutral-300"}`}
-                title={`${t.page} ${idx + 1}`}
               >
                 {idx + 1}
               </button>
@@ -557,15 +760,15 @@ export default function CanvasEditor() {
           </div>
         </div>
       )}
+      
       {toast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 rounded-md bg-neutral-800 px-3 py-2 text-sm text-white shadow">
           {toast}
         </div>
       )}
+      
       <input ref={fileInputRef} type="file" accept="image/*,application/pdf" className="hidden" onChange={onFileSelect} />
-      {image && (
-        <div className="mt-2 text-xs text-neutral-500">{t.undo_hint}</div>
-      )}
+      
       {image && (
         <div className="mt-1">
           <button
@@ -576,40 +779,86 @@ export default function CanvasEditor() {
           </button>
         </div>
       )}
+      
+      {/* 文本编辑弹窗 */}
       {textInputRect && (
-        <div className="fixed inset-0 flex items-center justify-center bg-black/40">
-          <div className="rounded-lg border border-neutral-700 bg-neutral-900 p-4">
-            <div className="text-sm mb-2 text-neutral-200">{t.enter_text}</div>
-            <input
-              autoFocus
-              value={textInputValue}
-              onChange={(e) => setTextInputValue(e.target.value)}
-              className="w-64 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-2 text-neutral-100 outline-none"
-            />
-            <div className="mt-3 flex justify-end gap-2">
+        <div className="fixed inset-0 flex items-center justify-center bg-black/40 z-50">
+          <div className="rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-2xl">
+            <div className="text-sm mb-2 text-neutral-200 font-medium">
+              {editingTextIndex !== null ? "Edit Text" : t.enter_text}
+            </div>
+            
+            <div className="flex flex-col gap-3">
+              <input
+                autoFocus
+                value={textInputValue}
+                onChange={(e) => setTextInputValue(e.target.value)}
+                placeholder="Type something..."
+                className="w-72 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-2 text-neutral-100 outline-none focus:border-emerald-500 transition-colors"
+              />
+              
+              <div className="flex items-center gap-2 text-neutral-400 text-xs">
+                <Type className="w-3 h-3" />
+                <span>Font Size: {fontSize}px</span>
+                <input 
+                  type="range" 
+                  min={10} max={80} 
+                  value={fontSize} 
+                  onChange={(e) => setFontSize(Number(e.target.value))} 
+                  className="flex-1"
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2">
               <button
                 onClick={() => {
                   setTextInputRect(null);
                   setTextInputValue("");
+                  setEditingTextIndex(null);
                 }}
-                className="rounded-md bg-neutral-800 px-3 py-1 text-neutral-200 hover:bg-neutral-700"
+                className="rounded-md bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-700 transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={() => {
                   const rect = textInputRect!;
-                  const action: Action = { type: "text", rect, color, text: textInputValue };
+                  // ✨✨✨ 修复：使用 getAverageColorFromImage 从原始图片吸色
+                  // 这样就不怕旧色块干扰了
+                  const { bgColor, textColor } = getAverageColorFromImage(image, rect);
+                  
+                  const action: Action = { 
+                    type: "text", 
+                    rect, 
+                    color: bgColor, 
+                    text: textInputValue, 
+                    textColor,
+                    fontSize
+                  };
+                  
                   setPages((prev) => {
                     const copy = [...prev];
                     const p = copy[current];
-                    copy[current] = { ...p, actions: [...p.actions, action] };
+                    
+                    if (editingTextIndex !== null) {
+                      // ✨ 编辑旧的 -> 替换 (不会新建，解决了叠加问题)
+                      const newActions = [...p.actions];
+                      newActions[editingTextIndex] = action;
+                      copy[current] = { ...p, actions: newActions };
+                    } else {
+                      // ✨ 新建
+                      copy[current] = { ...p, actions: [...p.actions, action] };
+                    }
                     return copy;
                   });
+                  
                   setTextInputRect(null);
                   setTextInputValue("");
+                  setEditingTextIndex(null);
+                  setSelectedIndex(null); // 完成后取消选中
                 }}
-                className="rounded-md bg-emerald-600 px-3 py-1 text-white hover:bg-emerald-500"
+                className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-500 transition-colors"
               >
                 OK
               </button>
