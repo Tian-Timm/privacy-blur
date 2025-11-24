@@ -4,7 +4,7 @@ import { Copy, Download, Undo2, ImagePlus, Sparkles, Grid2x2, Square, Wand2, Fil
 import { useLanguage } from "@/context/LanguageContext";
 import { translations } from "@/lib/translations";
 import { jsPDF } from "jspdf";
-import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import { GlobalWorkerOptions, getDocument, version } from "pdfjs-dist";
 import Tesseract from "tesseract.js";
 
 type ToolType = "blur" | "pixelate" | "block" | "text";
@@ -310,7 +310,7 @@ export default function CanvasEditor() {
         const c = document.createElement("canvas");
         c.width = viewport.width;
         c.height = viewport.height;
-        await page.render({ canvasContext: c.getContext("2d") as CanvasRenderingContext2D, viewport }).promise;
+        await page.render({ canvasContext: c.getContext("2d") as CanvasRenderingContext2D, viewport } as any).promise;
         const img = new Image();
         img.src = c.toDataURL("image/png");
         await new Promise<void>((res) => { img.onload = () => res(); });
@@ -484,7 +484,7 @@ export default function CanvasEditor() {
                   const canvas = canvasRef.current;
                   if (!canvas) { setScanning(false); return; }
                   const result = await Tesseract.recognize(canvas, "eng");
-                  const words = (result.data.words ?? []) as { text?: string; bbox?: { x0: number; y0: number; x1: number; y1: number } }[];
+                  const words = ((result.data as any).words ?? []) as { text?: string; bbox?: { x0: number; y0: number; x1: number; y1: number } }[];
                   const email = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
                   const phone = /(\+?\d[\d\s-]{7,}\d)/;
                   const toAdd: Action[] = [];
