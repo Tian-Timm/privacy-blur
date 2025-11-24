@@ -97,7 +97,8 @@ export default function CanvasStage(props: Props) {
         const ctmp = document.createElement("canvas");
         ctmp.width = off.width;
         ctmp.height = off.height;
-        await page.render({ canvasContext: ctmp.getContext("2d") as CanvasRenderingContext2D, viewport }).promise;
+        // 注意：在花括号 } 后面加上 as any
+await page.render({ canvasContext: ctmp.getContext("2d") as CanvasRenderingContext2D, viewport } as any).promise;
         ctxOff.clearRect(0, 0, off.width, off.height);
         ctxOff.drawImage(ctmp, 0, 0);
         setStageSize({ w: off.width, h: off.height });
@@ -116,6 +117,7 @@ export default function CanvasStage(props: Props) {
       for (const act of actions) {
         applyAction(ctxOff2, baseBitmap, act);
       }
+      if (!canvas) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       canvas.width = Math.max(1, canvas.clientWidth);
