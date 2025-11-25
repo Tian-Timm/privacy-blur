@@ -45,49 +45,55 @@ function loadImageFromBlob(blob: Blob): Promise<HTMLImageElement> {
 
 // ✨✨✨ 核心修复：从【原始图片】中计算平均色 (彻底解决叠加变黑问题)
 function getAverageColorFromImage(image: HTMLImageElement, rect: Rect) {
-  // 1. 创建一个小画布，只画我们需要采样的那部分
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
   if (!ctx) return { bgColor: "#000000", textColor: "#ffffff" };
 
-  // 扩展采样区域 (Padding)
-  const pad = 5;
-  const sampleX = Math.max(0, Math.floor(rect.x - pad));
-  const sampleY = Math.max(0, Math.floor(rect.y - pad));
-  const sampleW = Math.min(image.naturalWidth - sampleX, Math.floor(rect.w + pad * 2));
-  const sampleH = Math.min(image.naturalHeight - sampleY, Math.floor(rect.h + pad * 2));
+  let totalR = 0;
+  let totalG = 0;
+  let totalB = 0;
+  let count = 0;
 
-  canvas.width = sampleW;
-  canvas.height = sampleH;
+  const topY = Math.max(0, Math.round(rect.y) - 1);
+  const bottomY = Math.min(image.naturalHeight - 1, Math.round(rect.y + rect.h) + 1);
+  const leftX = Math.max(0, Math.round(rect.x) - 1);
+  const rightX = Math.min(image.naturalWidth - 1, Math.round(rect.x + rect.w) + 1);
 
-  // 2. 将原始图片的那一部分画到临时画布上
-  ctx.drawImage(image, sampleX, sampleY, sampleW, sampleH, 0, 0, sampleW, sampleH);
+  const topW = Math.max(0, Math.min(Math.round(rect.w), image.naturalWidth - Math.round(rect.x)));
+  const leftH = Math.max(0, Math.min(Math.round(rect.h), image.naturalHeight - Math.round(rect.y)));
 
-  // 3. 获取像素数据 (只取边缘，为了简单这里取整体平均，效果也很好且更快)
-  // 如果需要严格边缘，可以像之前一样只遍历边界像素。这里为了性能取整体区域的平均值。
-  // 鉴于 Text Overlay 通常很小，取整体平均也是一种很棒的融合效果。
-  const imgData = ctx.getImageData(0, 0, sampleW, sampleH);
-  const data = imgData.data;
+  const segments: { sx: number; sy: number; sw: number; sh: number }[] = [];
+  if (topW > 0) {
+    segments.push({ sx: Math.round(rect.x), sy: topY, sw: topW, sh: 1 });
+    segments.push({ sx: Math.round(rect.x), sy: bottomY, sw: topW, sh: 1 });
+  }
+  if (leftH > 0) {
+    segments.push({ sx: leftX, sy: Math.round(rect.y), sw: 1, sh: leftH });
+    segments.push({ sx: rightX, sy: Math.round(rect.y), sw: 1, sh: leftH });
+  }
 
-  let totalR = 0, totalG = 0, totalB = 0, count = 0;
-  
-  for (let i = 0; i < data.length; i += 4) {
-    totalR += data[i];
-    totalG += data[i + 1];
-    totalB += data[i + 2];
-    count++;
+  for (const seg of segments) {
+    if (seg.sw <= 0 || seg.sh <= 0) continue;
+    canvas.width = seg.sw;
+    canvas.height = seg.sh;
+    ctx.clearRect(0, 0, seg.sw, seg.sh);
+    ctx.drawImage(image, seg.sx, seg.sy, seg.sw, seg.sh, 0, 0, seg.sw, seg.sh);
+    const data = ctx.getImageData(0, 0, seg.sw, seg.sh).data;
+    for (let i = 0; i < data.length; i += 4) {
+      totalR += data[i];
+      totalG += data[i + 1];
+      totalB += data[i + 2];
+      count++;
+    }
   }
 
   if (count === 0) return { bgColor: "#000000", textColor: "#ffffff" };
-
   const r = Math.round(totalR / count);
   const g = Math.round(totalG / count);
-  const bVal = Math.round(totalB / count);
-  
-  const brightness = (r * 299 + g * 587 + bVal * 114) / 1000;
+  const b = Math.round(totalB / count);
+  const brightness = (r * 299 + g * 587 + b * 114) / 1000;
   const textColor = brightness > 128 ? "#000000" : "#ffffff";
-  const bgColor = `rgb(${r}, ${g}, ${bVal})`;
-  
+  const bgColor = `rgb(${r}, ${g}, ${b})`;
   return { bgColor, textColor };
 }
 
@@ -128,6 +134,7 @@ export default function CanvasEditor() {
   const [fontSize, setFontSize] = useState(16);
   // 专门用于区分：当前弹窗是在编辑哪个旧 Item，还是在新建
   const [editingTextIndex, setEditingTextIndex] = useState<number | null>(null); 
+  const [inputBackgroundColor, setInputBackgroundColor] = useState<string>("#000000");
 
   const canvasSize = useMemo(() => {
     if (!image) return { width: 0, height: 0 };
@@ -394,16 +401,7 @@ export default function CanvasEditor() {
         const pos = getRelativeCoords(e);
         const dist = Math.sqrt(Math.pow(pos.x - startPoint.x, 2) + Math.pow(pos.y - startPoint.y, 2));
 
-        if (dist < 5) {
-          // 🔹 点击：如果是文本，打开编辑
-          const act = actions[selectedIndex];
-          if (act.type === "text") {
-            setEditingTextIndex(selectedIndex); // 记录正在编辑第几个
-            setTextInputValue(act.text || "");
-            setTextInputRect(act.rect);
-            setFontSize(act.fontSize || 16);
-          }
-        } else {
+        if (dist >= 5) {
           // 🔹 拖拽结束：重新计算变色龙背景 (如果是文本)
           const act = actions[selectedIndex];
           if (act.type === "text") {
@@ -438,7 +436,6 @@ export default function CanvasEditor() {
       return;
     }
 
-    // @ts-ignore
     const action: Action = {
       type: tool as Exclude<ToolType, "move">,
       rect: previewRect,
@@ -450,8 +447,12 @@ export default function CanvasEditor() {
     if (tool === "text") {
       setTextInputRect(previewRect);
       setTextInputValue("");
-      setEditingTextIndex(null); // 表示这是新建
+      setEditingTextIndex(null);
       setFontSize(16);
+      if (image) {
+        const { bgColor } = getAverageColorFromImage(image, previewRect);
+        setInputBackgroundColor(bgColor);
+      }
     } else {
       setPages((prev) => {
         const copy = [...prev];
@@ -545,7 +546,7 @@ export default function CanvasEditor() {
         const c = document.createElement("canvas");
         c.width = viewport.width;
         c.height = viewport.height;
-        await page.render({ canvasContext: c.getContext("2d") as CanvasRenderingContext2D, viewport } as any).promise;
+        await page.render({ canvasContext: c.getContext("2d") as CanvasRenderingContext2D, viewport }).promise;
         const img = new Image();
         img.src = c.toDataURL("image/png");
         await new Promise<void>((res) => { img.onload = () => res(); });
@@ -626,6 +627,29 @@ export default function CanvasEditor() {
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
+              onDoubleClick={(e) => {
+                const rect = canvasRef.current?.getBoundingClientRect();
+                if (!rect) return;
+                const canvas = canvasRef.current!;
+                const scaleX = canvas.width / rect.width;
+                const scaleY = canvas.height / rect.height;
+                const x = (e.clientX - rect.left) * scaleX;
+                const y = (e.clientY - rect.top) * scaleY;
+                for (let i = actions.length - 1; i >= 0; i--) {
+                  const act = actions[i];
+                  const r = act.rect;
+                  if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+                    if (act.type === "text") {
+                      setEditingTextIndex(i);
+                      setTextInputRect(r);
+                      setTextInputValue(act.text || "");
+                      setFontSize(act.fontSize || 16);
+                      setInputBackgroundColor(act.color || "#000000");
+                    }
+                    break;
+                  }
+                }
+              }}
               className={`w-full h-auto block touch-none ${tool === "move" ? "cursor-move" : "cursor-crosshair"}`}
             />
           </div>
@@ -760,7 +784,95 @@ export default function CanvasEditor() {
           </div>
         </div>
       )}
-      
+
+      {selectedIndex !== null && actions[selectedIndex]?.type === "text" && image && (
+        (() => {
+          const act = actions[selectedIndex]!;
+          const canvas = canvasRef.current!;
+          const rect = canvas.getBoundingClientRect();
+          const scaleX = rect.width / canvas.width;
+          const scaleY = rect.height / canvas.height;
+          const left = rect.left + act.rect.x * scaleX;
+          const top = rect.top + (act.rect.y + act.rect.h) * scaleY + 8;
+          const style: React.CSSProperties = {
+            position: "fixed",
+            left,
+            top,
+            zIndex: 50,
+          };
+          return (
+            <div style={style} className="bg-neutral-800/90 backdrop-blur border border-neutral-700 rounded-lg p-2 flex gap-3 items-center shadow-xl">
+              <div className="flex items-center gap-2 text-neutral-200 text-xs">
+                <span>Font</span>
+                <input
+                  type="range"
+                  min={10}
+                  max={80}
+                  value={act.fontSize ?? 16}
+                  onChange={(e) => {
+                    const fs = Number(e.target.value);
+                    setPages((prev) => {
+                      const copy = [...prev];
+                      const p = copy[current];
+                      const na = [...p.actions];
+                      na[selectedIndex!] = { ...na[selectedIndex!], fontSize: fs };
+                      copy[current] = { ...p, actions: na };
+                      return copy;
+                    });
+                  }}
+                />
+              </div>
+              <div className="flex items-center gap-2 text-neutral-200 text-xs">
+                <span>Background</span>
+                <input
+                  type="color"
+                  value={act.color ?? "#000000"}
+                  onChange={(e) => {
+                    const bg = e.target.value;
+                    const m = bg.match(/#([0-9a-f]{6})/i);
+                    let r = 0, g = 0, b = 0;
+                    if (m) {
+                      const hex = m[1];
+                      r = parseInt(hex.slice(0,2), 16);
+                      g = parseInt(hex.slice(2,4), 16);
+                      b = parseInt(hex.slice(4,6), 16);
+                    }
+                    const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                    const tc = brightness > 128 ? "#000000" : "#ffffff";
+                    setPages((prev) => {
+                      const copy = [...prev];
+                      const p = copy[current];
+                      const na = [...p.actions];
+                      na[selectedIndex!] = { ...na[selectedIndex!], color: bg, textColor: tc };
+                      copy[current] = { ...p, actions: na };
+                      return copy;
+                    });
+                  }}
+                />
+              </div>
+              <button
+                onClick={deleteSelected}
+                className="inline-flex items-center gap-1 rounded-md bg-red-900/50 px-2 py-1 text-xs text-red-200 hover:bg-red-900/70 border border-red-800"
+              >
+                Delete
+              </button>
+              <button
+                onClick={() => {
+                  const a = actions[selectedIndex!];
+                  setEditingTextIndex(selectedIndex!);
+                  setTextInputRect(a.rect);
+                  setTextInputValue(a.text || "");
+                  setFontSize(a.fontSize || 16);
+                  setInputBackgroundColor(a.color || "#000000");
+                }}
+                className="inline-flex items-center gap-1 rounded-md bg-neutral-700 px-2 py-1 text-xs text-neutral-100 hover:bg-neutral-600"
+              >
+                Edit
+              </button>
+            </div>
+          );
+        })()
+      )}
       {toast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 rounded-md bg-neutral-800 px-3 py-2 text-sm text-white shadow">
           {toast}
@@ -807,6 +919,13 @@ export default function CanvasEditor() {
                   onChange={(e) => setFontSize(Number(e.target.value))} 
                   className="flex-1"
                 />
+                <span className="ml-3">Background</span>
+                <input
+                  type="color"
+                  value={inputBackgroundColor}
+                  onChange={(e) => setInputBackgroundColor(e.target.value)}
+                  className="w-8 h-8 rounded-md border border-neutral-700 bg-neutral-800"
+                />
               </div>
             </div>
 
@@ -824,39 +943,44 @@ export default function CanvasEditor() {
               <button
                 onClick={() => {
                   const rect = textInputRect!;
-                  // ✨✨✨ 修复：使用 getAverageColorFromImage 从原始图片吸色
-                  // 这样就不怕旧色块干扰了
-                  const { bgColor, textColor } = getAverageColorFromImage(image, rect);
-                  
+                  const tc = (() => {
+                    const c = inputBackgroundColor.toLowerCase();
+                    let r = 0, g = 0, b = 0;
+                    if (c.startsWith("#") && (c.length === 7)) {
+                      r = parseInt(c.slice(1,3), 16);
+                      g = parseInt(c.slice(3,5), 16);
+                      b = parseInt(c.slice(5,7), 16);
+                    } else if (c.startsWith("rgb")) {
+                      const m = c.match(/rgb\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)/);
+                      if (m) { r = parseInt(m[1],10); g = parseInt(m[2],10); b = parseInt(m[3],10); }
+                    }
+                    const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                    return brightness > 128 ? "#000000" : "#ffffff";
+                  })();
                   const action: Action = { 
                     type: "text", 
                     rect, 
-                    color: bgColor, 
+                    color: inputBackgroundColor, 
                     text: textInputValue, 
-                    textColor,
+                    textColor: tc,
                     fontSize
                   };
-                  
                   setPages((prev) => {
                     const copy = [...prev];
                     const p = copy[current];
-                    
                     if (editingTextIndex !== null) {
-                      // ✨ 编辑旧的 -> 替换 (不会新建，解决了叠加问题)
                       const newActions = [...p.actions];
                       newActions[editingTextIndex] = action;
                       copy[current] = { ...p, actions: newActions };
                     } else {
-                      // ✨ 新建
                       copy[current] = { ...p, actions: [...p.actions, action] };
                     }
                     return copy;
                   });
-                  
                   setTextInputRect(null);
                   setTextInputValue("");
                   setEditingTextIndex(null);
-                  setSelectedIndex(null); // 完成后取消选中
+                  setSelectedIndex(null);
                 }}
                 className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-500 transition-colors"
               >
